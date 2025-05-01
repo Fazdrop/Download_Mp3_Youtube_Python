@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="id">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>YouTube Audio Downloader</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        max-width: 600px;
+        margin: 0 auto;
+        padding: 20px;
+      }
+      h1 {
+        color: #333;
+      }
+      input[type="text"] {
+        width: 100%;
+        padding: 10px;
+        margin-bottom: 10px;
+        box-sizing: border-box;
+      }
+      button {
+        padding: 10px 20px;
+        background-color: #4caf50;
+        color: white;
+        border: none;
+        cursor: pointer;
+      }
+      button:hover {
+        background-color: #45a049;
+      }
+      #progress-container {
+        margin-top: 20px;
+        background-color: #f0f0f0;
+        border: 1px solid #ddd;
+        border-radius: 5px;
+        overflow: hidden;
+        display: none;
+      }
+      #progress-bar {
+        width: 0%;
+        height: 30px;
+        background-color: #4caf50;
+        text-align: center;
+        line-height: 30px;
+        color: white;
+        transition: width 0.2s ease-in-out;
+      }
+      #percentage-text {
+        margin-top: 10px;
+        font-weight: bold;
+        font-size: 16px;
+      }
+      #status {
+        margin-top: 10px;
+        font-size: 14px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>YouTube Audio Downloader</h1>
+    <form id="download-form">
+      <input
+        type="text"
+        id="url"
+        name="url"
+        placeholder="Masukkan URL YouTube"
+        required
+      />
+      <button type="submit">Unduh</button>
+    </form>
+    <div id="progress-container">
+      <div id="progress-bar"></div>
+    </div>
+    <div id="percentage-text"></div>
+    <div id="status"></div>
+
+    <script>
+      document
+        .getElementById("download-form")
+        .addEventListener("submit", function (e) {
+          e.preventDefault();
+          const url = document.getElementById("url").value;
+          const progressBar = document.getElementById("progress-bar");
+          const progressContainer =
+            document.getElementById("progress-container");
+          const percentageText = document.getElementById("percentage-text");
+          const statusDiv = document.getElementById("status");
+
+          // Reset UI
+          progressContainer.style.display = "block";
+          progressBar.style.width = "0%";
+          progressBar.textContent = "0%";
+          percentageText.textContent = "Memuat: 0%";
+          statusDiv.textContent = "Memulai unduhan...";
+
+          const eventSource = new EventSource(
+            "/download?url=" + encodeURIComponent(url)
+          );
+
+          eventSource.onmessage = function (event) {
+            try {
+              const data = JSON.parse(event.data);
+              console.log("Data SSE:", data);
+              updateProgress(data);
+            } catch (err) {
+              console.error("Gagal mem-parsing data:", err);
+              statusDiv.textContent = "Kesalahan mem-parsing data progres";
+            }
+          };
+
+          eventSource.onerror = function (error) {
+            console.error("Koneksi SSE gagal:", error);
+            eventSource.close();
+            statusDiv.textContent = "Terjadi kesalahan koneksi";
+            progressContainer.style.display = "none";
+            percentageText.textContent = "";
+          };
+
+          eventSource.onopen = function () {
+            console.log("Koneksi SSE terbuka");
+          };
+
+          function updateProgress(data) {
+            if (data.status === "downloading") {
+              const percent = Math.min(parseFloat(data.percent) || 0, 100);
+              console.log(`Memperbarui ke ${percent}%`);
+              progressBar.style.width = `${percent}%`;
+              progressBar.textContent = `${percent.toFixed(1)}%`;
+              percentageText.textContent = `Memuat: ${percent.toFixed(1)}%`;
+              statusDiv.textContent = `Kecepatan: ${data.speed}, ETA: ${data.eta}`;
+            } else if (data.status === "processing") {
+              progressBar.style.width = "100%";
+              progressBar.textContent = "100%";
+              percentageText.textContent = "Memuat: 100%";
+              statusDiv.textContent = "Memproses file...";
+            } else if (data.status === "completed") {
+              progressBar.style.width = "100%";
+              progressBar.textContent = "100%";
+              percentageText.textContent = "Memuat: 100%";
+              statusDiv.textContent = "Unduhan selesai!";
+              alert("Unduhan telah selesai!");
+              eventSource.close();
+              progressContainer.style.display = "none";
+            } else if (data.status === "error") {
+              statusDiv.textContent = `Kesalahan: ${data.message}`;
+              percentageText.textContent = "";
+              eventSource.close();
+              progressContainer.style.display = "none";
+            }
+          }
+        });
+    </script>
+  </body>
+</html>
