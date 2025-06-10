@@ -1,176 +1,178 @@
 import logging
-from flask import Flask, render_template, request, Response
+from flask import Flask, render_template, request, Response, jsonify
 import yt_dlp
 import os
 import json
-import time
+import queue
 import threading
-from urllib.parse import urlparse
 
-app = Flask(__name__)
-logging.basicConfig(level=logging.DEBUG)
+# --- Konfigurasi Aplikasi ---
+# Menggunakan folder 'templates' default, yang merupakan praktik terbaik di Flask.
+app = Flask(__name__) 
 
-# Direktori penyimpanan
+# Konfigurasi logging yang lebih detail untuk memudahkan debugging.
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s'
+)
 
-output_directory = 'your_path_here'  # Ganti dengan path yang sesuai
-if not os.path.exists(output_directory):
-    os.makedirs(output_directory)
+# --- Konfigurasi Path (Sesuai Permintaan Anda) ---
+# CATATAN: Hardcoding path seperti ini cocok untuk penggunaan pribadi di komputer Anda.
+# Untuk aplikasi yang akan didistribusikan atau di-deploy, disarankan menggunakan 
+# variabel lingkungan (environment variables) atau file konfigurasi agar lebih fleksibel.
+OUTPUT_DIRECTORY = 'C:\\Users\\muham\\Music\\Music\\'
+FFMPEG_PATH = 'C:\\ffmpeg\\ffmpeg.exe'
 
-# Daftar untuk menyimpan pembaruan progres
-progress_updates = []
-download_completed = False  # Flag untuk menandai bahwa unduhan selesai
-
-def is_valid_youtube_url(url):
-    """
-    Memeriksa apakah URL yang diberikan adalah URL valid dari YouTube.
-
-    Args:
-        url (str): URL yang akan divalidasi.
-
-    Returns:
-        bool: True jika URL valid untuk YouTube, False jika tidak.
-    """
+# --- Validasi Path Saat Startup ---
+# Memeriksa dan membuat direktori jika belum ada untuk mencegah error saat runtime.
+if not os.path.exists(OUTPUT_DIRECTORY):
     try:
-        parsed = urlparse(url)
-        return parsed.netloc in ['www.youtube.com', 'youtube.com', 'youtu.be']
-    except:
-        return False
+        os.makedirs(OUTPUT_DIRECTORY)
+        logging.info(f"Direktori '{OUTPUT_DIRECTORY}' berhasil dibuat.")
+    except OSError as e:
+        logging.critical(f"KRITIS: Gagal membuat direktori output '{OUTPUT_DIRECTORY}': {e}. Aplikasi akan berhenti.")
+        exit()
 
-def progress_hook(d):
+if not os.path.exists(FFMPEG_PATH):
+    logging.warning(f"PERINGATAN: FFMPEG tidak ditemukan di '{FFMPEG_PATH}'. Proses konversi ke MP3 akan gagal.")
+
+
+class DownloadManager:
     """
-    Hook callback yang dijalankan oleh yt_dlp saat proses download berlangsung.
-
-    Args:
-        d (dict): Dictionary berisi status dan data progres unduhan.
+    Mengelola state untuk satu sesi unduhan secara terisolasi dan thread-safe.
+    Setiap permintaan ke /download akan membuat instance baru dari kelas ini.
     """
-    global download_completed
-    if d['status'] == 'downloading':
-        percent = d.get('_percent_str', '0%').replace('%', '').strip()
-        speed = d.get('_speed_str', '0B/s')
-        eta = d.get('_eta_str', 'N/A')
-        progress = {
-            'status': 'downloading',
-            'percent': percent,
-            'speed': speed,
-            'eta': eta
-        }
-        logging.debug(f"Pembaruan progres: {progress}")
-        progress_updates.append(progress)
-    elif d['status'] == 'finished':
-        logging.debug("Unduhan selesai, sedang memproses...")
-        progress_updates.append({'status': 'processing'})
-        download_completed = True
-    elif d['status'] == 'error':
-        logging.debug("Terjadi kesalahan unduhan")
-        progress_updates.append({'status': 'error', 'message': 'Unduhan gagal'})
+    def __init__(self):
+        self.progress_queue = queue.Queue()
 
-def download_youtube_audio(url, output_path=output_directory, ffmpeg_path='C:\\ffmpeg\\ffmpeg.exe'):
-    """
-    Mengunduh audio dari URL YouTube dan mengirim progres melalui SSE (Server-Sent Events).
-
-    Args:
-        url (str): URL video YouTube yang akan diunduh.
-        output_path (str): Direktori tempat file audio akan disimpan.
-        ffmpeg_path (str): Lokasi file executable ffmpeg.
-
-    Returns:
-        Response: Response streaming (SSE) yang mengirim pembaruan progres unduhan.
-    """
-    global download_completed
-    progress_updates.clear()
-    download_completed = False
-
-    ydl_opts = {
-        'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best',
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }],
-        'outtmpl': os.path.join(output_path, '%(title)s.%(ext)s'),
-        'ffmpeg_location': ffmpeg_path,
-        'progress_hooks': [progress_hook],
-        'noplaylist': True,
-        'progress_delta': 0.1,
-    }
-
-    def download():
+    def progress_hook(self, d):
         """
-        Fungsi generator untuk menjalankan proses unduhan dan mengirimkan progres secara real-time.
+        Hook untuk yt_dlp. Dipanggil pada setiap update progres.
+        Fungsi ini berjalan di dalam thread yt_dlp, sehingga aman untuk memasukkan item ke queue.
         """
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                if not info.get('formats'):
-                    yield f"data: {json.dumps({'status': 'error', 'message': 'Format audio tidak tersedia'})}\n\n"
-                    return
+            if d['status'] == 'downloading':
+                progress = {
+                    'status': 'downloading',
+                    'percent': d.get('_percent_str', '0%').replace('%', '').strip(),
+                    'speed': d.get('_speed_str', 'N/A'),
+                    'eta': d.get('_eta_str', 'N/A')
+                }
+                self.progress_queue.put(progress)
+            
+            elif d['status'] == 'finished':
+                # Status 'finished' berarti file asli (misal .webm) sudah terunduh
+                # dan post-processing (konversi ke mp3) akan dimulai atau telah selesai.
+                self.progress_queue.put({'status': 'processing'})
+                
+                # Ekstrak nama file final dari info_dict
+                info_dict = d.get('info_dict', {})
+                final_filepath = info_dict.get('filepath')
+                filename = "audio.mp3" # Nama file default jika tidak ditemukan
+                
+                if final_filepath:
+                    # Ambil nama dasar file dan pastikan ekstensinya .mp3
+                    base = os.path.basename(final_filepath)
+                    filename = os.path.splitext(base)[0] + '.mp3'
 
-                # Simulasi progres awal
-                for i in range(0, 30, 5):
-                    progress = {'status': 'downloading', 'percent': str(i), 'speed': 'N/A', 'eta': 'N/A'}
-                    progress_updates.append(progress)
-                    yield f"data: {json.dumps(progress)}\n\n"
-                    time.sleep(0.2)
-
-                def run_download():
-                    """Menjalankan proses unduhan secara terpisah dalam thread."""
-                    ydl.download([url])
-
-                download_thread = threading.Thread(target=run_download)
-                download_thread.start()
-
-                current_percent = 30
-                while not download_completed and current_percent < 90:
-                    progress = {'status': 'downloading', 'percent': str(current_percent), 'speed': 'N/A', 'eta': 'N/A'}
-                    progress_updates.append(progress)
-                    yield f"data: {json.dumps(progress)}\n\n"
-                    time.sleep(0.2)
-                    current_percent += 5
-
-                download_thread.join()
-
-                for i in range(current_percent, 101, 5):
-                    progress = {'status': 'downloading', 'percent': str(i), 'speed': 'N/A', 'eta': 'N/A'}
-                    progress_updates.append(progress)
-                    yield f"data: {json.dumps(progress)}\n\n"
-                    time.sleep(0.2)
-
-                yield f"data: {json.dumps({'status': 'processing'})}\n\n"
-                time.sleep(0.5)
-                yield f"data: {json.dumps({'status': 'completed'})}\n\n"
-        except yt_dlp.utils.DownloadError as e:
-            yield f"data: {json.dumps({'status': 'error', 'message': f'Gagal mengunduh: {str(e)}'})}\n\n"
+                # Beri jeda singkat agar pesan 'processing' terlihat di UI sebelum mengirim 'completed'.
+                # Ini meningkatkan pengalaman pengguna (UX).
+                threading.Timer(1.5, lambda: self.progress_queue.put({
+                    'status': 'completed',
+                    'filename': filename
+                })).start()
         except Exception as e:
-            yield f"data: {json.dumps({'status': 'error', 'message': f'Kesalahan tak terduga: {str(e)}'})}\n\n"
+            logging.error(f"Error di dalam progress_hook: {e}")
 
-    return Response(download(), content_type='text/event-stream', headers={
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive'
-    })
+
+    def get_ydl_opts(self):
+        """Mendapatkan opsi untuk yt_dlp dengan path yang sudah ditentukan."""
+        return {
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+            'outtmpl': os.path.join(OUTPUT_DIRECTORY, '%(title)s.%(ext)s'),
+            'ffmpeg_location': FFMPEG_PATH,
+            'progress_hooks': [self.progress_hook],
+            'noplaylist': True, # Hanya unduh satu video, bukan seluruh playlist
+            'quiet': True, # Mengurangi output log dari yt-dlp di console
+        }
+
+# --- Rute Aplikasi (Endpoints) ---
 
 @app.route('/')
 def index():
-    """
-    Menampilkan halaman utama (index.html) ke pengguna.
-    
-    Returns:
-        str: Render dari template HTML.
-    """
+    """Menampilkan halaman utama dari file 'index.html' di dalam folder 'templates'."""
     return render_template('index.html')
 
-@app.route('/download', methods=['GET', 'POST'])
-def download():
-    """
-    Endpoint untuk memulai proses pengunduhan audio dari YouTube.
+@app.route('/get-info', methods=['POST'])
+def get_info():
+    """Endpoint untuk mengambil info video (thumbnail & judul) untuk fitur pratinjau."""
+    data = request.get_json()
+    url = data.get('url')
+    if not url:
+        return jsonify({'success': False, 'error': 'URL tidak disediakan'}), 400
 
-    Returns:
-        Response: Progres unduhan atau pesan kesalahan jika URL tidak valid.
-    """
-    url = request.args.get('url') or request.form.get('url')
-    if not url or not is_valid_youtube_url(url):
-        return "URL tidak valid", 400
-    return download_youtube_audio(url)
+    logging.info(f"Mengambil info untuk URL: {url}")
+    try:
+        # Opsi untuk hanya mengambil informasi tanpa mengunduh
+        ydl_opts = {'noplaylist': True, 'quiet': True}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return jsonify({
+                'success': True,
+                'title': info.get('title', 'Judul tidak ditemukan'),
+                'thumbnail': info.get('thumbnail', '')
+            })
+    except Exception as e:
+        logging.error(f"Gagal mengambil info untuk URL '{url}': {e}")
+        return jsonify({'success': False, 'error': 'Gagal mengambil informasi video. URL mungkin tidak valid.'}), 500
+
+
+@app.route('/download')
+def download():
+    """Endpoint untuk streaming progres unduhan menggunakan Server-Sent Events (SSE)."""
+    url = request.args.get('url')
+    if not url:
+        return Response("data: " + json.dumps({'status': 'error', 'message': 'URL tidak disediakan di parameter.'}) + "\n\n",
+                        content_type='text/event-stream')
+
+    manager = DownloadManager()
+
+    def download_thread_target():
+        """Fungsi yang dijalankan di thread terpisah untuk proses unduhan agar tidak memblokir server."""
+        logging.info(f"Memulai thread unduhan untuk URL: {url}")
+        try:
+            with yt_dlp.YoutubeDL(manager.get_ydl_opts()) as ydl:
+                ydl.download([url])
+        except Exception as e:
+            logging.error(f"Kesalahan pada thread unduhan untuk URL '{url}': {e}")
+            manager.progress_queue.put({'status': 'error', 'message': 'Proses unduhan gagal. Periksa URL dan coba lagi.'})
+
+    def generate_events():
+        """Generator yang mengambil progres dari queue dan mengirimkannya ke client."""
+        thread = threading.Thread(target=download_thread_target, name=f"Downloader-{threading.active_count()}")
+        thread.start()
+        
+        try:
+            while True:
+                progress = manager.progress_queue.get() # Akan menunggu sampai ada item baru
+                yield f"data: {json.dumps(progress)}\n\n"
+                
+                if progress['status'] in ['completed', 'error']:
+                    logging.info(f"Stream selesai untuk URL: {url} dengan status: {progress['status']}")
+                    break
+        finally:
+            # Pastikan thread selalu di-join untuk membersihkan resource, bahkan jika client disconnect.
+            thread.join()
+            logging.info(f"Thread unduhan untuk URL '{url}' telah di-join.")
+
+    return Response(generate_events(), content_type='text/event-stream')
+
 
 if __name__ == '__main__':
-    # Menjalankan server Flask dengan debug dan multithread aktif.
+    # Menjalankan server Flask dalam mode debug dan mengizinkan threading
     app.run(debug=True, threaded=True)
